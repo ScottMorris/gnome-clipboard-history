@@ -4,6 +4,7 @@ import * as DS from './dataStructures.js';
 
 let EXTENSION_UUID;
 let CACHE_DIR;
+let IMAGES_DIR;
 const OLD_REGISTRY_FILE = GLib.build_filenamev([
   GLib.get_user_cache_dir(),
   'clipboard-indicator@tudmotu.com',
@@ -28,6 +29,16 @@ const OP_TYPE_DELETE_TEXT = 2;
 const OP_TYPE_FAVORITE_ITEM = 3;
 const OP_TYPE_UNFAVORITE_ITEM = 4;
 const OP_TYPE_MOVE_ITEM_TO_END = 5;
+const OP_TYPE_SAVE_IMAGE = 6;
+
+const MIME_EXTENSIONS = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+  'image/tiff': 'tiff',
+  'image/webp': 'webp',
+};
 
 const MAX_WASTED_OPS = 500;
 let uselessOpCount;
@@ -40,6 +51,7 @@ export function init(uuid) {
   EXTENSION_UUID = uuid;
   CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), EXTENSION_UUID]);
   DATABASE_FILE = GLib.build_filenamev([CACHE_DIR, 'database.log']);
+  IMAGES_DIR = GLib.build_filenamev([CACHE_DIR, 'images']);
 
   if (GLib.mkdir_with_parents(CACHE_DIR, 0o775) !== 0) {
     console.log(
@@ -48,6 +60,18 @@ export function init(uuid) {
       CACHE_DIR,
     );
   }
+  if (GLib.mkdir_with_parents(IMAGES_DIR, 0o775) !== 0) {
+    console.log(
+      EXTENSION_UUID,
+      "Failed to create images cache dir, image support won't work",
+      IMAGES_DIR,
+    );
+  }
+}
+
+export function imagePath(checksum, mimeType) {
+  const extension = MIME_EXTENSIONS[mimeType] || 'bin';
+  return GLib.build_filenamev([IMAGES_DIR, `${checksum}.${extension}`]);
 }
 
 export function destroy() {
@@ -174,6 +198,38 @@ function _consumeStream(stream, state, callback) {
           state.entries.append(entry);
         }
       });
+    } else if (opType === OP_TYPE_SAVE_IMAGE) {
+      stream.read_upto_async(
+        /*stop_chars=*/ '\0',
+        /*stop_chars_len=*/ 1,
+        0,
+        null,
+        (src, res) => {
+          const [checksum] = src.read_upto_finish(res);
+          src.read_byte(null);
+
+          stream.read_upto_async('\0', 1, 0, null, (src2, res2) => {
+            const [mimeType] = src2.read_upto_finish(res2);
+            src2.read_byte(null);
+
+            stream.read_upto_async('\0', 1, 0, null, (src3, res3) => {
+              const [byteLength] = src3.read_upto_finish(res3);
+              src3.read_byte(null);
+
+              const node = new DS.LLNode();
+              node.diskId = node.id = state.nextId++;
+              node.type = DS.TYPE_IMAGE;
+              node.checksum = checksum || '';
+              node.mimeType = mimeType || '';
+              node.byteLength = parseInt(byteLength, 10) || 0;
+              node.favorite = false;
+              state.entries.append(node);
+
+              loop();
+            });
+          });
+        },
+      );
     } else {
       console.log(EXTENSION_UUID, 'Unknown op type, aborting load.', opType);
       finish();
@@ -346,6 +402,12 @@ export function resetDatabase(currentStateBuilder) {
 
             if (entry.type === DS.TYPE_TEXT) {
               _storeTextOp(entry.text)(dataStream);
+            } else if (entry.type === DS.TYPE_IMAGE) {
+              _storeImageOp(
+                entry.checksum,
+                entry.mimeType,
+                entry.byteLength,
+              )(dataStream);
             } else {
               throw new TypeError('Unknown type: ' + entry.type);
             }
@@ -372,6 +434,55 @@ function _storeTextOp(text) {
   return (dataStream) => {
     dataStream.put_byte(OP_TYPE_SAVE_TEXT, null);
     dataStream.put_string(text, null);
+    dataStream.put_byte(0, null); // NUL terminator
+    return true;
+  };
+}
+
+export function writeImageFile(checksum, mimeType, bytes, callback) {
+  Gio.File.new_for_path(
+    imagePath(checksum, mimeType),
+  ).replace_contents_bytes_async(
+    bytes,
+    null,
+    false,
+    Gio.FileCreateFlags.PRIVATE,
+    null,
+    (src, res) => {
+      src.replace_contents_finish(res);
+      callback?.();
+    },
+  );
+}
+
+export function deleteImageFile(checksum, mimeType) {
+  Gio.File.new_for_path(imagePath(checksum, mimeType)).delete_async(
+    GLib.PRIORITY_DEFAULT,
+    null,
+    (src, res) => {
+      try {
+        src.delete_finish(res);
+      } catch (e) {
+        if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+          console.log(EXTENSION_UUID, 'Failed to delete cached image', e);
+        }
+      }
+    },
+  );
+}
+
+export function storeImageEntry(checksum, mimeType, byteLength) {
+  _appendBytesToLog(_storeImageOp(checksum, mimeType, byteLength), -5);
+}
+
+function _storeImageOp(checksum, mimeType, byteLength) {
+  return (dataStream) => {
+    dataStream.put_byte(OP_TYPE_SAVE_IMAGE, null);
+    dataStream.put_string(checksum, null);
+    dataStream.put_byte(0, null); // NUL terminator
+    dataStream.put_string(mimeType, null);
+    dataStream.put_byte(0, null); // NUL terminator
+    dataStream.put_string(String(byteLength), null);
     dataStream.put_byte(0, null); // NUL terminator
     return true;
   };
