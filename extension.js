@@ -586,10 +586,19 @@ class ClipboardIndicator extends PanelMenu.Button {
       return;
     }
 
-    const path = Store.imagePath(entry.checksum, entry.mimeType);
-    const gicon = Gio.File.new_for_path(path).query_exists(null)
-      ? Gio.FileIcon.new(Gio.File.new_for_path(path))
-      : new Gio.ThemedIcon({ name: 'image-missing-symbolic' });
+    let gicon;
+    if (entry.bytes) {
+      // Not yet (or never going to be, under CACHE_ONLY_FAVORITES) written to
+      // disk -- render directly from the in-memory bytes.
+      gicon = Gio.BytesIcon.new(entry.bytes);
+    } else {
+      const file = Gio.File.new_for_path(
+        Store.imagePath(entry.checksum, entry.mimeType),
+      );
+      gicon = file.query_exists(null)
+        ? Gio.FileIcon.new(file)
+        : new Gio.ThemedIcon({ name: 'image-missing-symbolic' });
+    }
 
     menuItem._thumbnailIcon = new St.Icon({
       gicon,
@@ -597,6 +606,26 @@ class ClipboardIndicator extends PanelMenu.Button {
       style_class: 'ci-image-thumbnail',
     });
     menuItem.actor.insert_child_at_index(menuItem._thumbnailIcon, 0);
+  }
+
+  /**
+   * Writes an in-memory-only image entry's bytes to disk, then drops the in-memory
+   * copy and refreshes its thumbnail to read from the file instead.
+   */
+  _persistImageFile(entry) {
+    Store.writeImageFile(
+      entry.checksum,
+      entry.mimeType,
+      entry.bytes,
+      (success) => {
+        if (success) {
+          delete entry.bytes;
+        }
+        if (entry.menuItem) {
+          this._syncEntryThumbnail(entry.menuItem, entry);
+        }
+      },
+    );
   }
 
   _favoriteToggle(menuItem) {
@@ -615,6 +644,9 @@ class ClipboardIndicator extends PanelMenu.Button {
       if (entry.diskId) {
         Store.deleteTextEntry(entry.diskId, true);
         delete entry.diskId;
+        // Note: for images this intentionally leaves the (now unreferenced) cache
+        // file on disk rather than deleting it and reloading bytes into memory.
+        // It will be cleaned up once the entry is actually removed.
       }
       return;
     }
@@ -627,6 +659,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       if (entry.type === DS.TYPE_TEXT) {
         Store.storeTextEntry(entry.text);
       } else if (entry.type === DS.TYPE_IMAGE) {
+        this._persistImageFile(entry);
         Store.storeImageEntry(entry.checksum, entry.mimeType, entry.byteLength);
       }
       Store.updateFavoriteStatus(entry.diskId, true);
@@ -756,6 +789,19 @@ class ClipboardIndicator extends PanelMenu.Button {
   }
 
   _setClipboardImage(entry, callback) {
+    if (entry.bytes) {
+      if (this._debouncing !== undefined) {
+        this._debouncing++;
+      }
+      Clipboard.set_content(
+        St.ClipboardType.CLIPBOARD,
+        entry.mimeType,
+        entry.bytes,
+      );
+      callback?.();
+      return;
+    }
+
     const path = Store.imagePath(entry.checksum, entry.mimeType);
     Gio.File.new_for_path(path).load_bytes_async(null, (src, res) => {
       let bytes;
@@ -774,6 +820,11 @@ class ClipboardIndicator extends PanelMenu.Button {
           ),
         );
         this._deleteEntryAndRestoreLatest(entry);
+        return;
+      }
+
+      // A newer selection may have superseded this one while the file was loading.
+      if (this.currentlySelectedEntry !== entry) {
         return;
       }
 
@@ -1044,6 +1095,11 @@ class ClipboardIndicator extends PanelMenu.Button {
         Clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD),
       );
       if (!imageMimeType) {
+        // No text and no recognized image mimetype. Still route through
+        // _processClipboardContent so the debounce counter (incremented by our
+        // own clipboard writes) gets decremented; otherwise it can get stuck
+        // and silently swallow future real copies.
+        this._processClipboardContent(text, true);
         return;
       }
 
@@ -1080,6 +1136,28 @@ class ClipboardIndicator extends PanelMenu.Button {
     });
   }
 
+  _bringExistingEntryToFront(entry, selectEntry) {
+    const isFirst =
+      entry === this.entries.last() || entry === this.favoriteEntries.last();
+    if (!isFirst) {
+      this._moveEntryFirst(entry);
+    }
+    if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
+      this._selectEntry(entry, false);
+    }
+  }
+
+  _notifyCopied() {
+    if (!NOTIFY_ON_COPY) {
+      return;
+    }
+    this._showNotification(_('Copied to clipboard'), null, (notif) => {
+      notif.addAction(_('Cancel'), () =>
+        this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
+      );
+    });
+  }
+
   _processClipboardContent(text, selectEntry) {
     if (this._debouncing > 0) {
       this._debouncing--;
@@ -1097,14 +1175,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       this.entries.findTextItem(text) ||
       this.favoriteEntries.findTextItem(text);
     if (entry) {
-      const isFirst =
-        entry === this.entries.last() || entry === this.favoriteEntries.last();
-      if (!isFirst) {
-        this._moveEntryFirst(entry);
-      }
-      if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
-        this._selectEntry(entry, false);
-      }
+      this._bringExistingEntryToFront(entry, selectEntry);
     } else {
       entry = new DS.LLNode();
       entry.id = this.nextId++;
@@ -1121,13 +1192,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       this._pruneOldestEntries();
     }
 
-    if (NOTIFY_ON_COPY) {
-      this._showNotification(_('Copied to clipboard'), null, (notif) => {
-        notif.addAction(_('Cancel'), () =>
-          this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
-        );
-      });
-    }
+    this._notifyCopied();
 
     return text;
   }
@@ -1152,14 +1217,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       this.entries.findImageItem(checksum) ||
       this.favoriteEntries.findImageItem(checksum);
     if (entry) {
-      const isFirst =
-        entry === this.entries.last() || entry === this.favoriteEntries.last();
-      if (!isFirst) {
-        this._moveEntryFirst(entry);
-      }
-      if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
-        this._selectEntry(entry, false);
-      }
+      this._bringExistingEntryToFront(entry, selectEntry);
     } else {
       entry = new DS.LLNode();
       entry.id = this.nextId++;
@@ -1168,30 +1226,19 @@ class ClipboardIndicator extends PanelMenu.Button {
       entry.checksum = checksum;
       entry.mimeType = mimeType;
       entry.byteLength = byteLength;
+      entry.bytes = bytes;
       entry.favorite = false;
       this.entries.append(entry);
       this._addEntry(entry, selectEntry, false, 0);
 
-      Store.writeImageFile(checksum, mimeType, bytes, () => {
-        // The thumbnail was created before the file existed on disk; refresh it now
-        // that the image is actually readable.
-        if (entry.menuItem) {
-          this._syncEntryThumbnail(entry.menuItem, entry);
-        }
-      });
       if (!CACHE_ONLY_FAVORITES) {
+        this._persistImageFile(entry);
         Store.storeImageEntry(checksum, mimeType, byteLength);
       }
       this._pruneOldestEntries();
     }
 
-    if (NOTIFY_ON_COPY) {
-      this._showNotification(_('Copied to clipboard'), null, (notif) => {
-        notif.addAction(_('Cancel'), () =>
-          this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
-        );
-      });
-    }
+    this._notifyCopied();
   }
 
   _moveEntryFirst(entry) {
@@ -1413,6 +1460,7 @@ class ClipboardIndicator extends PanelMenu.Button {
           if (entry.type === DS.TYPE_TEXT) {
             Store.storeTextEntry(entry.text);
           } else if (entry.type === DS.TYPE_IMAGE) {
+            this._persistImageFile(entry);
             Store.storeImageEntry(
               entry.checksum,
               entry.mimeType,

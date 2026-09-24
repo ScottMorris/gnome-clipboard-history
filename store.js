@@ -119,6 +119,20 @@ function _parseLog(stream, callback) {
   _consumeStream(stream, state, callback);
 }
 
+function _readNulTerminatedString(stream, callback) {
+  stream.read_upto_async(
+    /*stop_chars=*/ '\0',
+    /*stop_chars_len=*/ 1,
+    0,
+    null,
+    (src, res) => {
+      const [value] = src.read_upto_finish(res);
+      src.read_byte(null); // Consume the NUL terminator
+      callback(value);
+    },
+  );
+}
+
 function _consumeStream(stream, state, callback) {
   const finish = () => {
     callback(state.entries, state.favorites, state.nextId);
@@ -199,37 +213,22 @@ function _consumeStream(stream, state, callback) {
         }
       });
     } else if (opType === OP_TYPE_SAVE_IMAGE) {
-      stream.read_upto_async(
-        /*stop_chars=*/ '\0',
-        /*stop_chars_len=*/ 1,
-        0,
-        null,
-        (src, res) => {
-          const [checksum] = src.read_upto_finish(res);
-          src.read_byte(null);
+      _readNulTerminatedString(stream, (checksum) => {
+        _readNulTerminatedString(stream, (mimeType) => {
+          _readNulTerminatedString(stream, (byteLength) => {
+            const node = new DS.LLNode();
+            node.diskId = node.id = state.nextId++;
+            node.type = DS.TYPE_IMAGE;
+            node.checksum = checksum || '';
+            node.mimeType = mimeType || '';
+            node.byteLength = parseInt(byteLength, 10) || 0;
+            node.favorite = false;
+            state.entries.append(node);
 
-          stream.read_upto_async('\0', 1, 0, null, (src2, res2) => {
-            const [mimeType] = src2.read_upto_finish(res2);
-            src2.read_byte(null);
-
-            stream.read_upto_async('\0', 1, 0, null, (src3, res3) => {
-              const [byteLength] = src3.read_upto_finish(res3);
-              src3.read_byte(null);
-
-              const node = new DS.LLNode();
-              node.diskId = node.id = state.nextId++;
-              node.type = DS.TYPE_IMAGE;
-              node.checksum = checksum || '';
-              node.mimeType = mimeType || '';
-              node.byteLength = parseInt(byteLength, 10) || 0;
-              node.favorite = false;
-              state.entries.append(node);
-
-              loop();
-            });
+            loop();
           });
-        },
-      );
+        });
+      });
     } else {
       console.log(EXTENSION_UUID, 'Unknown op type, aborting load.', opType);
       finish();
@@ -449,8 +448,14 @@ export function writeImageFile(checksum, mimeType, bytes, callback) {
     Gio.FileCreateFlags.PRIVATE,
     null,
     (src, res) => {
-      src.replace_contents_finish(res);
-      callback?.();
+      let success = true;
+      try {
+        src.replace_contents_finish(res);
+      } catch (e) {
+        console.log(EXTENSION_UUID, 'Failed to write cached image', e);
+        success = false;
+      }
+      callback?.(success);
     },
   );
 }
