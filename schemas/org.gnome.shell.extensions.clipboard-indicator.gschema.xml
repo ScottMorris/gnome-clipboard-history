@@ -49,6 +49,15 @@
       <range min="1" max="1024" />
     </key>
 
+    <key type="i" name="max-image-size">
+      <default>10</default>
+      <summary>The maximum size of an image to capture (MiB)</summary>
+      <description>
+        Copied images larger than this size are ignored and will not appear in the clipboard history.
+      </description>
+      <range min="1" max="1024" />
+    </key>
+
     <key name="cache-only-favorites" type="b">
       <default>false</default>
       <summary>Only save favorites to disk</summary>

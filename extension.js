@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -44,9 +45,19 @@ const INDICATOR_ICON = 'edit-paste-symbolic';
 
 const PAGE_SIZE = 50;
 const MAX_VISIBLE_CHARS = 200;
+const IMAGE_THUMBNAIL_SIZE = 48;
+const IMAGE_MIME_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/bmp',
+  'image/tiff',
+  'image/gif',
+  'image/webp',
+];
 
 let MAX_REGISTRY_LENGTH;
 let MAX_BYTES;
+let MAX_IMAGE_SIZE;
 let WINDOW_WIDTH_PERCENTAGE;
 let CACHE_ONLY_FAVORITES;
 let MOVE_ITEM_FIRST;
@@ -441,6 +452,7 @@ class ClipboardIndicator extends PanelMenu.Button {
     );
 
     this._setEntryLabel(menuItem);
+    this._syncEntryThumbnail(menuItem, entry);
 
     // Favorite button
     const icon_name = entry.favorite
@@ -544,9 +556,47 @@ class ClipboardIndicator extends PanelMenu.Button {
     const entry = menuItem.entry;
     if (entry.type === DS.TYPE_TEXT) {
       menuItem.label.set_text(this._truncated(entry.text, MAX_VISIBLE_CHARS));
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      menuItem.label.set_text(
+        `${_('Image')} (${this._formatBytes(entry.byteLength)})`,
+      );
     } else {
       throw new TypeError('Unknown type: ' + entry.type);
     }
+  }
+
+  _formatBytes(bytes) {
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+  }
+
+  _syncEntryThumbnail(menuItem, entry) {
+    if (menuItem._thumbnailIcon) {
+      menuItem._thumbnailIcon.destroy();
+      menuItem._thumbnailIcon = undefined;
+    }
+
+    if (entry.type !== DS.TYPE_IMAGE) {
+      return;
+    }
+
+    const path = Store.imagePath(entry.checksum, entry.mimeType);
+    const gicon = Gio.File.new_for_path(path).query_exists(null)
+      ? Gio.FileIcon.new(Gio.File.new_for_path(path))
+      : new Gio.ThemedIcon({ name: 'image-missing-symbolic' });
+
+    menuItem._thumbnailIcon = new St.Icon({
+      gicon,
+      icon_size: IMAGE_THUMBNAIL_SIZE,
+      style_class: 'ci-image-thumbnail',
+    });
+    menuItem.actor.insert_child_at_index(menuItem._thumbnailIcon, 0);
   }
 
   _favoriteToggle(menuItem) {
@@ -574,7 +624,11 @@ class ClipboardIndicator extends PanelMenu.Button {
     } else {
       entry.diskId = this.nextDiskId++;
 
-      Store.storeTextEntry(entry.text);
+      if (entry.type === DS.TYPE_TEXT) {
+        Store.storeTextEntry(entry.text);
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        Store.storeImageEntry(entry.checksum, entry.mimeType, entry.byteLength);
+      }
       Store.updateFavoriteStatus(entry.diskId, true);
     }
   }
@@ -609,6 +663,15 @@ class ClipboardIndicator extends PanelMenu.Button {
       this._resetSelectedMenuItem(true);
     }
 
+    for (const entry of this.entries) {
+      if (
+        entry.type === DS.TYPE_IMAGE &&
+        !this.favoriteEntries.findImageItem(entry.checksum)
+      ) {
+        Store.deleteImageFile(entry.checksum, entry.mimeType);
+      }
+    }
+
     // Favorites aren't touched when clearing history
     this.entries = new DS.LinkedList();
     this.historySection.removeAll();
@@ -622,6 +685,14 @@ class ClipboardIndicator extends PanelMenu.Button {
 
       if (entry.diskId) {
         Store.deleteTextEntry(entry.diskId, entry.favorite);
+      }
+      if (entry.type === DS.TYPE_IMAGE) {
+        const stillReferenced =
+          this.entries.findImageItem(entry.checksum) ||
+          this.favoriteEntries.findImageItem(entry.checksum);
+        if (!stillReferenced) {
+          Store.deleteImageFile(entry.checksum, entry.mimeType);
+        }
       }
     }
 
@@ -655,16 +726,23 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     entry.menuItem?.setOrnament(PopupMenu.Ornament.DOT);
     this._updateButtonText(entry);
-    if (updateClipboard !== false) {
-      if (entry.type === DS.TYPE_TEXT) {
-        this._setClipboardText(entry.text);
-      } else {
-        throw new TypeError('Unknown type: ' + entry.type);
-      }
+    if (updateClipboard === false) {
+      return;
+    }
 
+    const maybeTriggerPaste = () => {
       if (PASTE_ON_SELECTION && triggerPaste) {
         this._triggerPasteHack();
       }
+    };
+
+    if (entry.type === DS.TYPE_TEXT) {
+      this._setClipboardText(entry.text);
+      maybeTriggerPaste();
+    } else if (entry.type === DS.TYPE_IMAGE) {
+      this._setClipboardImage(entry, maybeTriggerPaste);
+    } else {
+      throw new TypeError('Unknown type: ' + entry.type);
     }
   }
 
@@ -675,6 +753,36 @@ class ClipboardIndicator extends PanelMenu.Button {
 
     Clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
     Clipboard.set_text(St.ClipboardType.PRIMARY, text);
+  }
+
+  _setClipboardImage(entry, callback) {
+    const path = Store.imagePath(entry.checksum, entry.mimeType);
+    Gio.File.new_for_path(path).load_bytes_async(null, (src, res) => {
+      let bytes;
+      try {
+        [bytes] = src.load_bytes_finish(res);
+      } catch (e) {
+        console.log(
+          this.uuid,
+          'Failed to load cached image, removing entry',
+          e,
+        );
+        this._showNotification(
+          _('Image unavailable'),
+          _(
+            'This image is no longer available and was removed from your history.',
+          ),
+        );
+        this._deleteEntryAndRestoreLatest(entry);
+        return;
+      }
+
+      if (this._debouncing !== undefined) {
+        this._debouncing++;
+      }
+      Clipboard.set_content(St.ClipboardType.CLIPBOARD, entry.mimeType, bytes);
+      callback?.();
+    });
   }
 
   _triggerPasteHack() {
@@ -812,6 +920,7 @@ class ClipboardIndicator extends PanelMenu.Button {
     entry.menuItem = item;
 
     this._setEntryLabel(item);
+    this._syncEntryThumbnail(item, entry);
     if (entry.id === this.currentlySelectedEntry?.id) {
       item.setOrnament(PopupMenu.Ornament.DOT);
     }
@@ -875,6 +984,8 @@ class ClipboardIndicator extends PanelMenu.Button {
             ),
           );
         }
+      } else if (entry.type === DS.TYPE_IMAGE) {
+        // Images have no text content to search.
       } else {
         throw new TypeError('Unknown type: ' + entry.type);
       }
@@ -914,13 +1025,35 @@ class ClipboardIndicator extends PanelMenu.Button {
     return false;
   }
 
+  _pickImageMimeType(mimetypes) {
+    return IMAGE_MIME_TYPES.find((mime) => mimetypes.includes(mime));
+  }
+
   _queryClipboard() {
     if (this._shouldAbortClipboardQuery(St.Clipboard.CLIPBOARD)) {
       return;
     }
 
     Clipboard.get_text(St.ClipboardType.CLIPBOARD, (_, text) => {
-      this._processClipboardContent(text, true);
+      if (text) {
+        this._processClipboardContent(text, true);
+        return;
+      }
+
+      const imageMimeType = this._pickImageMimeType(
+        Clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD),
+      );
+      if (!imageMimeType) {
+        return;
+      }
+
+      Clipboard.get_content(
+        St.ClipboardType.CLIPBOARD,
+        imageMimeType,
+        (_2, bytes) => {
+          this._processClipboardImage(bytes, imageMimeType, true);
+        },
+      );
     });
   }
 
@@ -934,6 +1067,7 @@ class ClipboardIndicator extends PanelMenu.Button {
       text = this._processClipboardContent(text, false);
       if (
         last &&
+        last.type === DS.TYPE_TEXT &&
         text &&
         text.length !== last.text.length &&
         (text.endsWith(last.text) ||
@@ -996,6 +1130,68 @@ class ClipboardIndicator extends PanelMenu.Button {
     }
 
     return text;
+  }
+
+  _processClipboardImage(bytes, mimeType, selectEntry) {
+    if (this._debouncing > 0) {
+      this._debouncing--;
+      return;
+    }
+
+    const byteLength = bytes ? bytes.get_size() : 0;
+    if (!byteLength || byteLength > MAX_IMAGE_SIZE) {
+      return;
+    }
+
+    const checksum = GLib.compute_checksum_for_bytes(
+      GLib.ChecksumType.SHA256,
+      bytes,
+    );
+
+    let entry =
+      this.entries.findImageItem(checksum) ||
+      this.favoriteEntries.findImageItem(checksum);
+    if (entry) {
+      const isFirst =
+        entry === this.entries.last() || entry === this.favoriteEntries.last();
+      if (!isFirst) {
+        this._moveEntryFirst(entry);
+      }
+      if (selectEntry && (!isFirst || entry !== this.currentlySelectedEntry)) {
+        this._selectEntry(entry, false);
+      }
+    } else {
+      entry = new DS.LLNode();
+      entry.id = this.nextId++;
+      entry.diskId = CACHE_ONLY_FAVORITES ? undefined : this.nextDiskId++;
+      entry.type = DS.TYPE_IMAGE;
+      entry.checksum = checksum;
+      entry.mimeType = mimeType;
+      entry.byteLength = byteLength;
+      entry.favorite = false;
+      this.entries.append(entry);
+      this._addEntry(entry, selectEntry, false, 0);
+
+      Store.writeImageFile(checksum, mimeType, bytes, () => {
+        // The thumbnail was created before the file existed on disk; refresh it now
+        // that the image is actually readable.
+        if (entry.menuItem) {
+          this._syncEntryThumbnail(entry.menuItem, entry);
+        }
+      });
+      if (!CACHE_ONLY_FAVORITES) {
+        Store.storeImageEntry(checksum, mimeType, byteLength);
+      }
+      this._pruneOldestEntries();
+    }
+
+    if (NOTIFY_ON_COPY) {
+      this._showNotification(_('Copied to clipboard'), null, (notif) => {
+        notif.addAction(_('Cancel'), () =>
+          this._deleteEntryAndRestoreLatest(this.currentlySelectedEntry),
+        );
+      });
+    }
   }
 
   _moveEntryFirst(entry) {
@@ -1158,6 +1354,8 @@ class ClipboardIndicator extends PanelMenu.Button {
     MAX_REGISTRY_LENGTH = this.settings.get_int(SettingsFields.HISTORY_SIZE);
     MAX_BYTES =
       (1 << 20) * this.settings.get_int(SettingsFields.CACHE_FILE_SIZE);
+    MAX_IMAGE_SIZE =
+      (1 << 20) * this.settings.get_int(SettingsFields.MAX_IMAGE_SIZE);
     WINDOW_WIDTH_PERCENTAGE = this.settings.get_int(
       SettingsFields.WINDOW_WIDTH_PERCENTAGE,
     );
@@ -1212,7 +1410,15 @@ class ClipboardIndicator extends PanelMenu.Button {
       } else {
         for (const entry of this.entries) {
           entry.diskId = this.nextDiskId++;
-          Store.storeTextEntry(entry.text);
+          if (entry.type === DS.TYPE_TEXT) {
+            Store.storeTextEntry(entry.text);
+          } else if (entry.type === DS.TYPE_IMAGE) {
+            Store.storeImageEntry(
+              entry.checksum,
+              entry.mimeType,
+              entry.byteLength,
+            );
+          }
         }
       }
     }

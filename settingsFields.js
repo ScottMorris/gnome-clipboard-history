@@ -2,6 +2,7 @@ const SettingsFields = {
   HISTORY_SIZE: 'history-size',
   WINDOW_WIDTH_PERCENTAGE: 'window-width-percentage',
   CACHE_FILE_SIZE: 'cache-size',
+  MAX_IMAGE_SIZE: 'max-image-size',
   CACHE_ONLY_FAVORITES: 'cache-only-favorites',
   NOTIFY_ON_COPY: 'notify-on-copy',
   CONFIRM_ON_CLEAR: 'confirm-clear',
