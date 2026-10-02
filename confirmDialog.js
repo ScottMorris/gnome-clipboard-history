@@ -2,9 +2,23 @@ import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import GObject from 'gi://GObject';
 
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 
 let _openDialog;
+
+// St.BoxLayout's `vertical` property was deprecated in GNOME Shell 48 in favor of
+// `orientation` and removed entirely in GNOME Shell 51.
+const SHELL_VERSION = parseInt(Config.PACKAGE_VERSION.split('.')[0]);
+function boxLayoutOrientation(vertical) {
+  return SHELL_VERSION >= 48
+    ? {
+        orientation: vertical
+          ? Clutter.Orientation.VERTICAL
+          : Clutter.Orientation.HORIZONTAL,
+      }
+    : { vertical };
+}
 
 export function openConfirmDialog(
   title,
@@ -31,12 +45,12 @@ const ConfirmDialog = GObject.registerClass(
       super._init();
 
       let main_box = new St.BoxLayout({
-        vertical: false,
+        ...boxLayoutOrientation(false),
       });
       this.contentLayout.add_child(main_box);
 
       let message_box = new St.BoxLayout({
-        vertical: true,
+        ...boxLayoutOrientation(true),
       });
       main_box.add_child(message_box);
 

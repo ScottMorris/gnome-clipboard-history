@@ -6,6 +6,7 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -24,17 +25,36 @@ import { openConfirmDialog } from './confirmDialog.js';
 import SettingsFields from './settingsFields.js';
 
 const Clipboard = St.Clipboard.get_default();
+// Clutter.get_default_backend() was removed in GNOME Shell 51; global.stage.context
+// is the replacement and has been available since GNOME Shell 48.
+const getClutterBackend = () =>
+  global.stage.context
+    ? global.stage.context.get_backend()
+    : Clutter.get_default_backend();
 const VirtualKeyboard = (() => {
   let VirtualKeyboard;
   return () => {
     if (!VirtualKeyboard) {
-      VirtualKeyboard = Clutter.get_default_backend()
+      VirtualKeyboard = getClutterBackend()
         .get_default_seat()
         .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
     }
     return VirtualKeyboard;
   };
 })();
+
+// St.BoxLayout's `vertical` property was deprecated in GNOME Shell 48 in favor of
+// `orientation` and removed entirely in GNOME Shell 51.
+const SHELL_VERSION = parseInt(Config.PACKAGE_VERSION.split('.')[0]);
+function boxLayoutOrientation(vertical) {
+  return SHELL_VERSION >= 48
+    ? {
+        orientation: vertical
+          ? Clutter.Orientation.VERTICAL
+          : Clutter.Orientation.HORIZONTAL,
+      }
+    : { vertical };
+}
 
 const SETTING_KEY_CLEAR_HISTORY = 'clear-history';
 const SETTING_KEY_PREV_ENTRY = 'prev-entry';
@@ -191,7 +211,7 @@ class ClipboardIndicator extends PanelMenu.Button {
     const actionsSection = new PopupMenu.PopupMenuSection();
     const actionsBox = new St.BoxLayout({
       style_class: 'ci-history-actions-section',
-      vertical: false,
+      ...boxLayoutOrientation(false),
     });
 
     actionsSection.actor.add_child(actionsBox);
@@ -1343,11 +1363,21 @@ class ClipboardIndicator extends PanelMenu.Button {
     Main.messageTray.add(this._notifSource);
   }
 
+  _notificationsSettings() {
+    if (!this._notifSettings) {
+      this._notifSettings = new Gio.Settings({
+        schema_id: 'org.gnome.desktop.notifications',
+      });
+    }
+    return this._notifSettings;
+  }
+
   _showNotification(title, message, transformFn) {
+    // Read the stable org.gnome.desktop.notifications schema directly instead of
+    // reaching into dateMenu's private indicator, which has changed shape across
+    // GNOME Shell releases (e.g. the GNOME 51 quick-settings Do Not Disturb move).
     const dndOn = () =>
-      !Main.panel.statusArea.dateMenu._indicator._settings.get_boolean(
-        'show-banners',
-      );
+      !this._notificationsSettings().get_boolean('show-banners');
     if (PRIVATE_MODE || dndOn()) {
       return;
     }
